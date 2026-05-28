@@ -25,6 +25,12 @@ from progress.observability import agent, workflow, task, tool
 load_dotenv(override=True)
 
 # --- Observability Setup ---
+# This is where the magic happens. The SDK hooks into OpenAI and LangChain
+# automatically, creating spans for every LLM call without extra code.
+# trace_content=True is critical: it captures the actual inputs/outputs of each
+# span, which is the only way to see *what* data the LLM received (not just that
+# it was called). Without it, you can't distinguish a healthy trace from a silently
+# broken one.
 Observability.instrument(
     app_name=os.getenv("OBSERVABILITY_APP_NAME"),
     api_key=os.getenv("OBSERVABILITY_API_KEY"),
@@ -33,7 +39,6 @@ Observability.instrument(
         ObservabilityInstruments.OPENAI,
         ObservabilityInstruments.LANGCHAIN,
     },
-    # additional_tags=["demo", "silent-failures"],
 )
 
 model = ChatOpenAI(
@@ -43,10 +48,16 @@ model = ChatOpenAI(
 
 
 # --- Tools (each can fail silently: 200 OK but bad data) ---
+# These simulate real-world API integrations. Each tool returns HTTP 200 with valid
+# JSON every time -- no exceptions, no error codes. The failures are purely semantic:
+# empty results, partial data, or stale cache. Traditional monitoring sees nothing wrong.
+# The @tool decorator creates an OpenTelemetry span that captures inputs and outputs.
 
 @tool(name="search-flights")
 def search_flights(origin: str, destination: str, date: str) -> dict:
     """Search flights. ~30% chance of 200 OK with empty results."""
+    # Silent failure mode: provider is degraded, returns valid but empty response.
+    # The agent interprets this as "no flights exist" rather than "I couldn't get data."
     if random.random() < 0.3:
         return {"status": 200, "results": [], "metadata": {"provider": "skyapi"}}
     return {
@@ -62,6 +73,9 @@ def search_flights(origin: str, destination: str, date: str) -> dict:
 @tool(name="search-hotels")
 def search_hotels(city: str, checkin: str, checkout: str) -> dict:
     """Search hotels. ~25% chance of partial provider response."""
+    # Silent failure mode: the API aggregates from 3 upstream providers.
+    # Two time out internally, but the API still returns 200 with whatever it got.
+    # The "partial: True" flag exists in the metadata but nobody checks it.
     if random.random() < 0.25:
         return {
             "status": 200,
@@ -81,8 +95,11 @@ def search_hotels(city: str, checkin: str, checkout: str) -> dict:
 @tool(name="get-preferences")
 def get_preferences(user_id: str) -> dict:
     """Fetch user preferences. ~20% chance of returning stale cached data."""
+    # Silent failure mode: the endpoint serves a cached response that is 180 days old.
+    # The user changed their preference from "luxury" to "budget" months ago, but
+    # the cache still returns the old value. The agent filters results using stale
+    # preferences, showing expensive options to someone who asked for cheap ones.
     if random.random() < 0.2:
-        # Stale cache: user changed to "budget" months ago but cache still says "luxury"
         return {
             "status": 200,
             "preferences": {"budget": "luxury", "stops": "direct-only"},
@@ -96,6 +113,11 @@ def get_preferences(user_id: str) -> dict:
 
 
 # --- Validation Layer (makes silent failures visible in traces) ---
+# This is the key pattern. These functions do almost nothing computationally.
+# Their purpose is purely observational: they create a span in the trace that
+# explicitly says "this data is bad" when a silent failure occurs. Without them,
+# every span in the trace looks successful. With them, you get a filterable signal
+# that something is semantically wrong -- even though no exception was thrown.
 
 @task(name="validate-results")
 def validate_results(data: dict, min_results: int = 1) -> dict:
@@ -129,6 +151,10 @@ def validate_preferences(data: dict, max_cache_age_days: int = 7) -> dict:
 
 
 # --- Workflow ---
+# The workflow composes tools and validation into a single traced operation.
+# Pattern: call a tool, then immediately validate. This creates adjacent spans
+# in the trace tree so when you open a broken trace, you see exactly which tool
+# returned bad data and what the validation found wrong.
 
 @workflow(name="search-and-book", version=1)
 def search_and_book(origin: str, destination: str, date: str) -> dict:
@@ -159,7 +185,9 @@ def handle_booking_request(query: str) -> dict:
     """Top-level agent. Returns 'success' even when data is bad."""
     result = search_and_book("New York", "Barcelona", "2026-06-15")
 
-    # LLM synthesizes a response from whatever data it got
+    # This is where the silent failure becomes dangerous: the LLM receives whatever
+    # data came back (empty, partial, stale) and generates a confident, helpful-sounding
+    # response. It doesn't know the data is degraded. It just does its job.
     lang_agent = create_agent(model, tools=[])
     llm_result = lang_agent.invoke({
         "messages": [
@@ -176,6 +204,9 @@ def handle_booking_request(query: str) -> dict:
 
 
 # --- Entry Point ---
+# Run this 20-30 times to generate a mix of healthy and broken traces.
+# Then explore them at https://observability.progress.com -- look for traces where
+# status is "success" but all_valid is False. That gap is where silent failures live.
 if __name__ == "__main__":
     print("Running booking agent...\n")
     try:
