@@ -22,18 +22,21 @@ from langchain.agents import create_agent
 from progress.observability import Observability, ObservabilityInstruments
 from progress.observability import agent, workflow, task, tool
 
-load_dotenv()
+load_dotenv(override=True)
 
 # --- Observability Setup ---
+print(f"app_name: {os.getenv('OBSERVABILITY_APP_NAME')}")
+print(f"api_key: {os.getenv('OBSERVABILITY_API_KEY')}")
+
 Observability.instrument(
-    app_name="booking-agent",
+    app_name=os.getenv("OBSERVABILITY_APP_NAME"),
     api_key=os.getenv("OBSERVABILITY_API_KEY"),
     trace_content=True,
     instruments={
         ObservabilityInstruments.OPENAI,
         ObservabilityInstruments.LANGCHAIN,
     },
-    additional_tags=["demo", "silent-failures"],
+    # additional_tags=["demo", "silent-failures"],
 )
 
 model = ChatOpenAI(
@@ -78,6 +81,23 @@ def search_hotels(city: str, checkin: str, checkout: str) -> dict:
     }
 
 
+@tool(name="get-preferences")
+def get_preferences(user_id: str) -> dict:
+    """Fetch user preferences. ~20% chance of returning stale cached data."""
+    if random.random() < 0.2:
+        # Stale cache: user changed to "budget" months ago but cache still says "luxury"
+        return {
+            "status": 200,
+            "preferences": {"budget": "luxury", "stops": "direct-only"},
+            "metadata": {"cached": True, "cache_age_days": 180},
+        }
+    return {
+        "status": 200,
+        "preferences": {"budget": "budget", "stops": "any"},
+        "metadata": {"cached": False, "cache_age_days": 0},
+    }
+
+
 # --- Validation Layer (makes silent failures visible in traces) ---
 
 @task(name="validate-results")
@@ -98,11 +118,27 @@ def validate_results(data: dict, min_results: int = 1) -> dict:
     return {"valid": len(issues) == 0, "issues": issues}
 
 
+@task(name="validate-preferences")
+def validate_preferences(data: dict, max_cache_age_days: int = 7) -> dict:
+    """Check if preferences data is fresh enough to trust."""
+    metadata = data.get("metadata", {})
+    cache_age = metadata.get("cache_age_days", 0)
+
+    issues = []
+    if cache_age > max_cache_age_days:
+        issues.append(f"stale_cache: {cache_age} days old, max allowed {max_cache_age_days}")
+
+    return {"valid": len(issues) == 0, "issues": issues}
+
+
 # --- Workflow ---
 
 @workflow(name="search-and-book", version=1)
 def search_and_book(origin: str, destination: str, date: str) -> dict:
-    """Search flights and hotels, validate each result."""
+    """Search flights, hotels, and preferences, validate each result."""
+    prefs = get_preferences("user-42")
+    prefs_check = validate_preferences(prefs)
+
     flights = search_flights(origin, destination, date)
     flight_check = validate_results(flights, min_results=1)
 
@@ -112,7 +148,12 @@ def search_and_book(origin: str, destination: str, date: str) -> dict:
     return {
         "flights": flights,
         "hotels": hotels,
-        "all_valid": flight_check["valid"] and hotel_check["valid"],
+        "preferences": prefs["preferences"],
+        "all_valid": (
+            flight_check["valid"]
+            and hotel_check["valid"]
+            and prefs_check["valid"]
+        ),
     }
 
 
