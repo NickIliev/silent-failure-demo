@@ -51,10 +51,16 @@ python silent_failure_demo.py
 
 Run it 20–30 times to generate a useful sample of trace outcomes.
 
-Optional loop command:
+Optional Bash loop command:
 
 ```bash
 for i in {1..25}; do python silent_failure_demo.py; done
+```
+
+If your shell does not support brace expansion, use:
+
+```bash
+for i in $(seq 1 25); do python silent_failure_demo.py; done
 ```
 
 ## Expected output
