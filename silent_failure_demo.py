@@ -25,9 +25,6 @@ from progress.observability import agent, workflow, task, tool
 load_dotenv(override=True)
 
 # --- Observability Setup ---
-print(f"app_name: {os.getenv('OBSERVABILITY_APP_NAME')}")
-print(f"api_key: {os.getenv('OBSERVABILITY_API_KEY')}")
-
 Observability.instrument(
     app_name=os.getenv("OBSERVABILITY_APP_NAME"),
     api_key=os.getenv("OBSERVABILITY_API_KEY"),
