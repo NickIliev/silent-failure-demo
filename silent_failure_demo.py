@@ -53,12 +53,16 @@ model = ChatOpenAI(
 # empty results, partial data, or stale cache. Traditional monitoring sees nothing wrong.
 # The @tool decorator creates an OpenTelemetry span that captures inputs and outputs.
 
+# Set NO_FAILURES=1 to force all tools to return healthy data (useful for generating
+# a baseline trace where the evaluation task scores 1).
+FORCE_SUCCESS = os.getenv("NO_FAILURES", "0") == "1"
+
 @tool(name="search-flights")
 def search_flights(origin: str, destination: str, date: str) -> dict:
     """Search flights. ~30% chance of 200 OK with empty results."""
     # Silent failure mode: provider is degraded, returns valid but empty response.
     # The agent interprets this as "no flights exist" rather than "I couldn't get data."
-    if random.random() < 0.3:
+    if not FORCE_SUCCESS and random.random() < 0.3:
         return {"status": 200, "results": [], "metadata": {"provider": "skyapi"}}
     return {
         "status": 200,
@@ -76,7 +80,7 @@ def search_hotels(city: str, checkin: str, checkout: str) -> dict:
     # Silent failure mode: the API aggregates from 3 upstream providers.
     # Two time out internally, but the API still returns 200 with whatever it got.
     # The "partial: True" flag exists in the metadata but nobody checks it.
-    if random.random() < 0.25:
+    if not FORCE_SUCCESS and random.random() < 0.25:
         return {
             "status": 200,
             "results": [{"hotel": "Budget Inn", "price": 45, "rating": 2.1}],
@@ -99,7 +103,7 @@ def get_preferences(user_id: str) -> dict:
     # The user changed their preference from "luxury" to "budget" months ago, but
     # the cache still returns the old value. The agent filters results using stale
     # preferences, showing expensive options to someone who asked for cheap ones.
-    if random.random() < 0.2:
+    if not FORCE_SUCCESS and random.random() < 0.2:
         return {
             "status": 200,
             "preferences": {"budget": "luxury", "stops": "direct-only"},
