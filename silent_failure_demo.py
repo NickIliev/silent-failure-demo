@@ -49,48 +49,41 @@ model = ChatOpenAI(
 
 # --- Tools (each can fail silently: 200 OK but bad data) ---
 # These simulate real-world API integrations. Each tool returns HTTP 200 with valid
-# JSON every time -- no exceptions, no error codes. The failures are purely semantic:
-# empty results, partial data, or stale cache. Traditional monitoring sees nothing wrong.
-# The @tool decorator creates an OpenTelemetry span that captures inputs and outputs.
+# JSON every time -- no exceptions, no error codes. The failure surface in this demo
+# is the hotel provider path: empty results or partial provider data. Traditional
+# monitoring sees nothing wrong. The @tool decorator creates an OpenTelemetry span
+# that captures inputs and outputs.
 
 # Set NO_FAILURES=1 to force all tools to return healthy data (useful for generating
 # a baseline trace where the evaluation task scores 1).
 FORCE_SUCCESS = os.getenv("NO_FAILURES", "0") == "1"
 
-@tool(name="search-flights")
-def search_flights(origin: str, destination: str, date: str) -> dict:
-    """Search flights. ~30% chance of 200 OK with empty results."""
-    # Silent failure mode: provider is degraded, returns valid but empty response.
-    # The agent interprets this as "no flights exist" rather than "I couldn't get data."
-    if not FORCE_SUCCESS and random.random() < 0.3:
-        return {"status": 200, "results": [], "metadata": {"provider": "skyapi"}}
-    return {
-        "status": 200,
-        "results": [
-            {"flight": "BA-442", "price": 389, "departure": "08:30", "stops": 0},
-            {"flight": "IB-1021", "price": 312, "departure": "14:15", "stops": 1},
-        ],
-        "metadata": {"provider": "skyapi"},
-    }
-
-
 @tool(name="search-hotels")
 def search_hotels(city: str, checkin: str, checkout: str) -> dict:
-    """Search hotels. ~25% chance of partial provider response."""
-    # Silent failure mode: the API aggregates from 3 upstream providers.
-    # Two time out internally, but the API still returns 200 with whatever it got.
-    # The "partial: True" flag exists in the metadata but nobody checks it.
-    if not FORCE_SUCCESS and random.random() < 0.25:
-        return {
-            "status": 200,
-            "results": [{"hotel": "Budget Inn", "price": 45, "rating": 2.1}],
-            "metadata": {"providers_queried": 3, "providers_responded": 1, "partial": True},
-        }
+    """Search hotels. May return empty or partial results while still returning 200 OK."""
+    # Silent failure mode 1: the provider is degraded and returns an empty result set.
+    # Silent failure mode 2: the API aggregates from 3 upstream providers, but only
+    # one responds. The API still returns 200 with whatever it got.
+    if not FORCE_SUCCESS:
+        roll = random.random()
+        if roll < 0.2:
+            return {
+                "status": 200,
+                "results": [],
+                "metadata": {"providers_queried": 3, "providers_responded": 3, "partial": False},
+            }
+        if roll < 0.45:
+            return {
+                "status": 200,
+                "results": [{"hotel": "Budget Inn", "price": 45, "rating": 2.1}],
+                "metadata": {"providers_queried": 3, "providers_responded": 1, "partial": True},
+            }
     return {
         "status": 200,
         "results": [
             {"hotel": "Grand Plaza", "price": 189, "rating": 4.5},
             {"hotel": "City Suites", "price": 142, "rating": 4.2},
+            {"hotel": "Harbor Rooms", "price": 128, "rating": 4.0},
         ],
         "metadata": {"providers_queried": 3, "providers_responded": 3, "partial": False},
     }
@@ -98,20 +91,10 @@ def search_hotels(city: str, checkin: str, checkout: str) -> dict:
 
 @tool(name="get-preferences")
 def get_preferences(user_id: str) -> dict:
-    """Fetch user preferences. ~20% chance of returning stale cached data."""
-    # Silent failure mode: the endpoint serves a cached response that is 180 days old.
-    # The user changed their preference from "luxury" to "budget" months ago, but
-    # the cache still returns the old value. The agent filters results using stale
-    # preferences, showing expensive options to someone who asked for cheap ones.
-    if not FORCE_SUCCESS and random.random() < 0.2:
-        return {
-            "status": 200,
-            "preferences": {"budget": "luxury", "stops": "direct-only"},
-            "metadata": {"cached": True, "cache_age_days": 180},
-        }
+    """Fetch user preferences. Healthy context for the hotel recommendation."""
     return {
         "status": 200,
-        "preferences": {"budget": "budget", "stops": "any"},
+        "preferences": {"budget": "budget", "location": "central", "rating": "3plus"},
         "metadata": {"cached": False, "cache_age_days": 0},
     }
 
@@ -158,29 +141,21 @@ def validate_preferences(data: dict, max_cache_age_days: int = 7) -> dict:
 # The workflow composes tools and validation into a single traced operation.
 # Pattern: call a tool, then immediately validate. This creates adjacent spans
 # in the trace tree so when you open a broken trace, you see exactly which tool
-# returned bad data and what the validation found wrong.
+# returned bad hotel data and what the validation found wrong.
 
 @workflow(name="search-and-book", version=1)
 def search_and_book(origin: str, destination: str, date: str) -> dict:
-    """Search flights, hotels, and preferences, validate each result."""
+    """Search hotels and preferences, validate each result."""
     prefs = get_preferences("user-42")
     prefs_check = validate_preferences(prefs)
-
-    flights = search_flights(origin, destination, date)
-    flight_check = validate_results(flights, min_results=1)
 
     hotels = search_hotels(destination, date, "2026-06-20")
     hotel_check = validate_results(hotels, min_results=2)
 
     return {
-        "flights": flights,
         "hotels": hotels,
         "preferences": prefs["preferences"],
-        "all_valid": (
-            flight_check["valid"]
-            and hotel_check["valid"]
-            and prefs_check["valid"]
-        ),
+        "all_valid": hotel_check["valid"] and prefs_check["valid"],
     }
 
 
@@ -190,12 +165,12 @@ def handle_booking_request(query: str) -> dict:
     result = search_and_book("New York", "Barcelona", "2026-06-15")
 
     # This is where the silent failure becomes dangerous: the LLM receives whatever
-    # data came back (empty, partial, stale) and generates a confident, helpful-sounding
-    # response. It doesn't know the data is degraded. It just does its job.
+    # hotel data came back (empty or partial) and generates a confident,
+    # helpful-sounding response. It doesn't know the data is degraded.
     lang_agent = create_agent(model, tools=[])
     llm_result = lang_agent.invoke({
         "messages": [
-            {"role": "system", "content": "Summarize travel options. Be helpful and confident."},
+            {"role": "system", "content": "Summarize hotel options. Be helpful and confident."},
             {"role": "user", "content": f"Data: {result}\n\nRequest: {query}"},
         ]
     })
@@ -215,7 +190,7 @@ if __name__ == "__main__":
     print("Running booking agent...\n")
     try:
         result = handle_booking_request(
-            "Book me a flight from NYC to Barcelona on June 15 and find a hotel."
+            "Find me a budget-friendly hotel in Barcelona from June 15 to June 20."
         )
         print(f"Status: {result['status']}")
         print(f"Data valid: {result['all_valid']}")
