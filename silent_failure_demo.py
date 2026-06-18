@@ -15,7 +15,10 @@ Usage:
 
 import os
 import random
+import ssl
+import tempfile
 import httpx
+import certifi
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain.agents import create_agent
@@ -23,6 +26,26 @@ from progress.observability import Observability, ObservabilityInstruments
 from progress.observability import agent, workflow, task, tool
 
 load_dotenv(override=True)
+
+# --- Fiddler proxy: extend CA trust ---
+# When Fiddler intercepts TLS it presents a cert signed by its own CA.
+# We merge the Fiddler CA into certifi's bundle so every HTTP client in
+# this process (httpx, requests, gRPC) trusts it without disabling verification.
+_fiddler_ca = os.getenv("FIDDLER_CA_CERT")
+_combined_ca_path = certifi.where()          # default: plain certifi bundle
+if _fiddler_ca and os.path.exists(_fiddler_ca):
+    _tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pem", mode="wb")
+    with open(certifi.where(), "rb") as f:
+        _tmp.write(f.read())
+    with open(_fiddler_ca, "rb") as f:
+        _tmp.write(f.read())
+    _tmp.close()
+    _combined_ca_path = _tmp.name
+    # requests / urllib3 / OTel OTLP HTTP exporter
+    os.environ["REQUESTS_CA_BUNDLE"] = _combined_ca_path
+    os.environ["SSL_CERT_FILE"] = _combined_ca_path
+    # OTel OTLP gRPC exporter
+    os.environ["OTEL_EXPORTER_OTLP_CERTIFICATE"] = _combined_ca_path
 
 # --- Observability Setup ---
 # This is where the magic happens. The SDK hooks into OpenAI and LangChain
@@ -41,9 +64,14 @@ Observability.instrument(
     },
 )
 
+# Build an SSL context that trusts certifi CAs + Fiddler CA so httpx
+# (used internally by the openai SDK) verifies Fiddler-intercepted TLS.
+_ssl_ctx = ssl.create_default_context(cafile=_combined_ca_path)
+
 model = ChatOpenAI(
     api_key=os.getenv("OPENAI_API_KEY"),
     model="gpt-4.1-mini",
+    http_client=httpx.Client(verify=_ssl_ctx),
 )
 
 
